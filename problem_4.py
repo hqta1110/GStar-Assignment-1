@@ -54,7 +54,43 @@ def _flash_attention_forward_causal_kernel(
         # 1. Load the K and V blocks for the current iteration.
         # 2. Compute the attention scores (S_ij).
         # 3. Update the online softmax statistics (m_i, l_i) and the accumulator (acc).
-        pass
+        k_offsets = start_n + tl.arange(0, BLOCK_N)                 # shape [BLOCK_N]
+        # Load K as [HEAD_DIM, BLOCK_N] to match tl.dot(q_block, k_block)
+        k_ptrs = (
+            K_ptr
+            + batch_idx * k_stride_b
+            + head_idx * k_stride_h
+            + (k_offsets[None, :] * k_stride_s + tl.arange(0, HEAD_DIM)[:, None])
+        )
+        # Load V as [BLOCK_N, HEAD_DIM] for p @ v
+        v_ptrs = (
+            V_ptr
+            + batch_idx * v_stride_b
+            + head_idx * v_stride_h
+            + (k_offsets[:, None] * v_stride_s + tl.arange(0, HEAD_DIM)[None, :])
+        )
+
+        k_block = tl.load(k_ptrs, mask=k_offsets[None, :] < SEQ_LEN, other=0.0)
+        v_block = tl.load(v_ptrs, mask=k_offsets[:, None] < SEQ_LEN, other=0.0).to(tl.float32)
+        
+        scores = tl.dot(q_block, k_block) * qk_scale
+        valid_cols = (k_offsets < SEQ_LEN)
+        valid_mask = valid_cols[None, :]
+        scores = tl.where(valid_mask==1.0, scores, -1e9)
+        
+        s_max = tl.max(scores, axis=1)
+        m_new = tl.maximum(m_i, s_max)
+        
+        exp_scale = tl.exp2(m_i - m_new)
+        acc = acc * exp_scale[:, None]
+        l_i = l_i * exp_scale
+        
+        prob = tl.exp2(scores - m_new[:, None])
+        prob = prob * valid_mask
+        acc += tl.dot(prob, v_block)
+        l_i += tl.sum(prob, axis = 1)
+        
+        m_i = m_new
         # --- END OF STUDENT IMPLEMENTATION ---
 
 
@@ -64,7 +100,44 @@ def _flash_attention_forward_causal_kernel(
     for start_n in range(diag_start, (q_block_idx + 1) * BLOCK_M, BLOCK_N):
         # --- STUDENT IMPLEMENTATION REQUIRED HERE ---
         # Implement the logic for the diagonal blocks, apply the causal mask to S_ij.
-        pass
+        k_offsets = start_n + tl.arange(0, BLOCK_N)
+
+        k_ptrs = (
+            K_ptr
+            + batch_idx * k_stride_b
+            + head_idx * k_stride_h
+            + (k_offsets[None, :] * k_stride_s + tl.arange(0, HEAD_DIM)[:, None])
+        )
+        v_ptrs = (
+            V_ptr
+            + batch_idx * v_stride_b
+            + head_idx * v_stride_h
+            + (k_offsets[:, None] * v_stride_s + tl.arange(0, HEAD_DIM)[None, :])
+        )
+
+        k_block = tl.load(k_ptrs, mask=k_offsets[None, :] < SEQ_LEN, other=0.0)
+        v_block = tl.load(v_ptrs, mask=k_offsets[:, None] < SEQ_LEN, other=0.0).to(tl.float32)
+        scores = tl.dot(q_block, k_block) * qk_scale
+        
+        causal_mask = (q_offsets[:, None] >= k_offsets[None, :])
+        valid_cols = (k_offsets < SEQ_LEN)
+        valid_mask = (causal_mask & valid_cols[None, :]).to(tl.float32)
+        scores = tl.where(valid_mask==1.0, scores, -1e9)
+        
+        s_max = tl.max(scores, axis=1)
+        m_new = tl.maximum(m_i, s_max)
+        
+        exp_scale = tl.exp2(m_i - m_new)
+        acc = acc * exp_scale[:, None]
+        l_i = l_i * exp_scale
+        
+        prob = tl.exp2(scores - m_new[:, None])
+        prob = prob * valid_mask
+        acc += tl.dot(prob, v_block)
+        l_i += tl.sum(prob, axis = 1)
+        
+        m_i = m_new
+        
         # --- END OF STUDENT IMPLEMENTATION ---
 
 
