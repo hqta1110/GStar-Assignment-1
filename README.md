@@ -28,8 +28,6 @@ This report documents the implementation of FlashAttention and its variants acro
   ```python
   O = acc / l_i[:, None]
   ```
-````
-
 * Serves as the **reference baseline** for all Triton kernels.
 
 ---
