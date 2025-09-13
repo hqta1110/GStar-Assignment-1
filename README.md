@@ -1,195 +1,109 @@
-# 🚀 GStar Bootcamp: Building Flash Attention from Scratch
+# FlashAttention Assignment Report
 
-## Overview
+This report documents the implementation of FlashAttention and its variants across seven problems. Each problem builds upon earlier work, reusing the same online softmax and blockwise strategy, while introducing new masking or memory management techniques.
 
-In this assignment, you'll embark on a journey that takes you from the mathematical foundations of attention mechanisms to implementing state-of-the-art Flash Attention kernels that power today's most advanced language models.
+---
 
-By the end of this assignment, you'll have built Flash Attention and its variants **completely from scratch** using both PyTorch and Triton, giving you deep understanding of how to optimize attention mechanisms at the GPU level. You're about to learn how this magic works - not just the theory, but by implementing every line of code yourself.
+## Problem 1 — PyTorch FlashAttention (Reference Implementation)
 
-## 📄 Bootcamp Companion PDF
+- Implemented the **forward pass** of FlashAttention in pure PyTorch.  
+- Queries (`Q`), Keys (`K`), and Values (`V`) are divided into **blocks**.  
+- For each query block:
+  - Stream over all key blocks.  
+  - Compute attention scores `S_ij = Q_block @ K_block^T / sqrt(d)`.  
+  - Apply masking if required:  
+    - **Causal mask** ensures tokens cannot attend to future tokens.  
+    - **Bounds mask** handles sequences shorter than the block size.  
+  - Update accumulators:
+    - `m_i`: running maximum of logits (for numerical stability).  
+    - `l_i`: running sum of exponentials.  
+    - `acc`: running weighted sum of values.  
+- Final output `O` is obtained as `acc / l_i`.  
+- This served as the **reference baseline** for later Triton kernels.
 
-**For detailed background, tutorials, and task descriptions, please see the accompanying PDF file.** This document is your primary guide for the theory and implementation details needed for each stage.
+---
 
-## What You'll Achieve
+## Problem 2 — Introduction to Triton
 
-By the end of this bootcamp, you'll have built Flash Attention from scratch, gaining a deep understanding of how and why it works—both its memory efficiency and mathematical exactness. You will also develop strong technical skills: writing efficient GPU kernels in Triton.
+- Learned Triton’s programming model:  
+  - **Block-level parallelism**: each kernel instance processes a query block.  
+  - **Pointer arithmetic**: construct memory pointers with tensor strides (`stride_b`, `stride_h`, `stride_s`).  
+  - **Vectorized loading**: use `tl.load` with masks to safely fetch data into SRAM.  
+- Implemented simple examples to practice **offset calculation** and **masking**.  
+- No attention logic yet, but built the foundation for memory-efficient kernels in later problems.
 
-Furthermore, you will see the real-world impact of your work by implementing the same algorithms that power production AI systems such as [GPT-OSS](https://openai.com/index/introducing-gpt-oss/), [Llama](https://huggingface.co/meta-llama), and [Gemma](https://huggingface.co/collections/google/gemma-3-release-67c6c6f89c4f76621268bb6d). You'll understand the optimization techniques that let modern LLMs handle long contexts or streaming conversations, and **you will be equipped with the foundation to contribute to next-generation AI infrastructure.**
+---
 
+## Problem 3 — FlashAttention in Triton (Non-Causal)
 
+- First full Triton implementation of FlashAttention forward pass.  
+- Used the **same online softmax method** as in Problem 1 (`m_i`, `l_i`, `acc`).  
+- Key elements:
+  - **Pointer construction**: queries, keys, and values are loaded into SRAM via block offsets.  
+  - **Bounds masks**: prevent out-of-bounds reads when sequence length is not divisible by block size.  
+  - **Accumulation loop**: iterate over key blocks, compute `Q_block @ K_block^T`, rescale accumulators, and update with new contributions.  
+- Produces correct outputs for the non-causal case, establishing the Triton baseline.
 
-### **SOTA Mastery** (Advanced Stages)
-- **Group Query Attention (GQA)**: A critical memory optimization technique that has become standard in modern large language models, including the Llama series, Gemma, GPT-OSS.
-- **Sliding Window**: A technique for efficiently processing long sequences by limiting the attention scope of each token to a fixed-size window.
-- **Attention Sinks**: A recent breakthrough that stabilizes model performance when dealing with streaming inputs. Recently adopted by [GPT-OSS].
-- **Backward Pass Implementation** (Optional): Deep understanding of gradient computation, recomputation, and autograd systems.
+---
 
+## Problem 4 — FlashAttention with Causal Masking
 
-## Your Four-Stage
+- Extended Problem 3 to support **causal masking**.  
+- Introduced a **two-phase strategy**:
+  1. **Off-diagonal blocks** (where all keys precede the current query block): no masking needed.  
+  2. **Diagonal block** (where queries and keys overlap): apply per-element causal mask `q_idx >= k_idx`.  
+- This optimization avoids unnecessary masking in most blocks and improves efficiency.  
+- Other logic (online softmax, pointer arithmetic, accumulation) reused from Problem 3.
 
-### Stage 1: The Foundation (PyTorch)
-**File**: `problem_1.py` - Implement Flash Attention in pure PyTorch. Learn tiling, online softmax, and why it's both efficient and exact.
+---
 
-### Stage 2: Your First GPU Kernel (Triton)
-**File**: `problem_2.py` - Write your first GPU kernel with weighted row sums. Grasp parallel thinking, memory access patterns, and block-based efficiency.
+## Problem 5 — Grouped-Query Attention (GQA)
 
-### Stage 3: Flash Attention Unleashed (Triton)
-**File**: `problem_3.py` — Turn your PyTorch version into a high-performance GPU kernel. Master online softmax at scale and reach production-level speed.
+- Built on the kernel from Problems 3–4.  
+- Implemented **head-sharing** between queries and fewer key/value heads:  
+  - Mapping: `kv_head_idx = q_head_idx // (num_q_heads // num_kv_heads)`.  
+- Key modifications:
+  - **Pointer arithmetic** for K and V changed to use `kv_head_idx` instead of `q_head_idx`.  
+  - Q still uses its original head index.  
+- This reduces the memory and compute cost of storing/processing K and V, while keeping the rest of the kernel unchanged.  
+- Masking and online softmax logic are identical to earlier problems.
 
-### Stage 4: The Causal Challenge (Triton)
-**File**: `problem_4.py` — Tackle causal masking in Large Language Models with two-phase kernels and tiled computation 
+---
 
-## Advanced Challenges (SOTA Variants)
+## Problem 6 — Sliding Window Attention (SWA)
 
-These advanced stages implement important optimizations used in modern AI systems:
+- Extended FlashAttention to support **local attention** with a fixed window size.  
+- Modifications compared to Problem 3–5:
+  - **Restricted iteration range**: for each query block, only process key blocks within the sliding window.  
+  - **Window mask**: ensure only tokens inside the window contribute to attention scores.  
+- Combined naturally with causal masking when needed.  
+- This shows how the blockwise pointer/masking framework can be adapted for locality constraints.
 
-### Stage 5: Grouped Query Attention (GQA)
-**File**: `problem_5.py` - Implement the K/V sharing trick behind Llama, Mistral, and others. Reduce memory significantly when scaling to billions of parameters.
+---
 
+## Problem 7 — Attention Sinks (with GQA + SWA)
 
-### Stage 6 + 7: Sliding Window Attention (SWA) and Attention Sinks
-**File**: `problem_6.py & problem_7.py` - Build local attention windows (with attention sinks) for infinite context
+- Final problem combined **GQA**, **sliding window attention**, and **attention sinks**.  
+- Design divided into multiple phases:
+  1. **Sink phase**: process initial sink tokens (globally visible to all queries).  
+  2. **Windowed off-diagonal phase**: process non-sink tokens within the sliding window.  
+  3. **Diagonal phase**: handle overlapping query/key blocks, applying both causal and window masks, and excluding sink tokens with a **non-sink mask**.  
+- Reused:
+  - GQA head mapping from Problem 5.  
+  - Sliding window iteration and masks from Problem 6.  
+- The main new addition is the **sink mask** and handling sinks as a separate phase.  
+- This problem demonstrated how multiple advanced constraints can be layered on top of the same core FlashAttention framework.
 
-### Stage 8 (Optional) : Backward Pass for Grouped Query Attention 
-**File**: `problem_8.py` - — Implement the backward pass for GQA to enable fine-tuning. Explore autograd internals, apply recomputation strategies, and optimize for memory-efficient backpropagation. 
+---
 
-### Research Challenge (Stage 9) (Optional): The Missing Piece for [GPT-OSS](https://cookbook.openai.com/articles/gpt-oss/fine-tune-transfomers) Finetuning
-**File** `problem_9.py` - This is a research-level (challenging) problem that addresses a real gap in today's ecosystem: enabling finetuning with Flash Attention when combined with Sliding Window and Attention Sinks.
+## Summary
 
-Since GPT-OSS release, people have not been able to finetune it with Flash Attention. OpenAI only provides the forward pass for inference. For training, the [OpenAI Cookbook](https://cookbook.openai.com/articles/gpt-oss/fine-tune-transfomers) and other resources fall back to naive attention, since the backward pass with Flash Attention is missing. Even official `flash_attn` library and related implementations currently lack support for finetuning with Flash Attention + Sliding Attention + Attention Sinks.
+- **Problem 1** provided a PyTorch baseline for FlashAttention.  
+- **Problem 2** introduced Triton basics.  
+- **Problem 3** implemented FlashAttention in Triton (non-causal).  
+- **Problem 4** added causal masking with a two-phase diagonal/off-diagonal approach.  
+- **Problem 5** introduced Grouped-Query Attention by modifying key/value head pointers.  
+- **Problem 6** extended the kernel with sliding window constraints.  
+- **Problem 7** integrated GQA, SWA, and sink tokens into a single unified kernel.  
 
-**Your challenge**: If you can solve problem_8, you will have the foundation to attempt problem_9: implementing the missing backward pass for GPT-OSS finetuning.
-
-
-## Prerequisites & Setup
-
-You'll need:
-- Python 3.8+
-- PyTorch with CUDA support
-- Triton library
-- A CUDA-capable GPU
-
-### Quick Setup
-```bash
-# Install dependencies
-pip install torch triton
-
-# Verify your GPU is ready
-python -c "import torch; print(f'CUDA ready: {torch.cuda.is_available()}')"
-```
-
-## File Structure
-
-```
-GStar/
-├── README.md                 # This file
-├── problem_1.py             # Stage 1: PyTorch FlashAttention (YOUR CODE HERE)
-├── problem_2.py             # Stage 2: Triton Weighted Row-Sum (YOUR CODE HERE)
-├── problem_3.py             # Stage 3: Triton FlashAttention Non-causal (YOUR CODE HERE)
-├── problem_4.py             # Stage 4: Triton FlashAttention Causal (YOUR CODE HERE)
-├── problem_5.py             # Stage 5: Grouped Query Attention (YOUR CODE HERE)
-├── problem_6.py             # Stage 6: Sliding Window Attention (YOUR CODE HERE)
-├── problem_7.py             # Stage 7: Attention Sinks (YOUR CODE HERE)
-├── problem_8.py             # Optional: GQA Backward Pass (BONUS CHALLENGE)
-├── problem_9.py             # Optional: GQA + SWDA + Attention Sinks Backward Pass (MORE CHALLENGE)
-├── autograder.py            # Automated testing and benchmarking
-├── autograder_optional.py   # Autograder for Stages 8 & 9
-└── .gitignore              # Git ignore file
-```
-
-## 💻 How to Work with Problem Files
-
-Each `problem_X.py` contains:
-- **Background and Detailed problem description** with mathematical background
-- **Function signatures** you need to implement
-- **Template code** with helpful comments and hints
-- **TODO markers** showing exactly where to add your code
-
-
-**Your Task**: Replace the `TODO` sections and `pass` statements with working implementations!
-
-## 🎯 Getting Started
-
-### Start with Stage 1
-Begin your journey with `problem_1.py` - it builds the foundation for everything else:
-
-```bash
-# Open the first problem file
-code problem_1.py
-
-# Read through the problem description and understand what you need to implement
-# Look for TODO markers and function signatures
-# Start implementing step by step
-
-# Test your progress frequently
-python autograder.py --p1
-```
-## Testing Your Implementations
-
-Your implementation journey is guided by a comprehensive autograder that validates correctness and measures performance against reference implementations.
-
-### Stage-by-Stage Testing (Problems 1–7)
-
-```bash
-python autograder.py --p1   # PyTorch baseline
-python autograder.py --p2   # First Triton kernel
-python autograder.py --p3   # FlashAttention (non-causal)
-python autograder.py --p4   # FlashAttention (causal)
-python autograder.py --p5   # Flash Group Query Attention
-python autograder.py --p6   # Flash Group Query Attention + Sliding Window Attention
-python autograder.py --p7   # Flash Group Query Attention + Sliding Window Attention & Attention Sinks
-```
-
-#### Optional Challenges (Problems 8–9)
-```bash
-python autograder_optional.py --p8   # Backward pass for GQA
-python autograder_optional.py --p9   # Backward pass for GQA + SWA + Attention Sinks
-```
-###  Test Output
-
-The autograder compares your implementation against mathematically correct reference implementations and provides detailed feedback:
-
-- **Correctness**: Your implementation must match the mathematical ground truth
-- **Performance**: Speed benchmarks show how your optimizations stack up
-- **Memory**: Efficiency metrics reveal your memory optimization gains  
-
-**What success looks like:**
-```
---- Running Autograder for Problem 3: Non-Causal Flash Attention ---
-✅ P3 Correctness Test Passed! (B=1, H=8, L=512, D=16)
-✅ P3 Correctness Test Passed! (B=1, H=8, L=1024, D=16)
-✅ P3 Correctness Test Passed! (B=1, H=16, L=2048, D=16)
-✅ P3 Correctness Test Passed! (B=1, H=16, L=4096, D=16)
-
-All P3 correctness tests passed!
-
---- Running Performance Benchmark ---
-Benchmark Config: B=1, H=16, L=4096, D=16, Causal=False
-
---- Benchmark Results ---
-Implementation            | Avg Time (ms)        | Peak Memory (GB)    
-----------------------------------------------------------------------
-PyTorch (Naive)           | 10.6512              | 3.0162              
-Triton (Flash)            | 0.2424               | 0.0157              
-----------------------------------------------------------------------
-Triton is 43.94x faster than PyTorch (Naive).
-Triton uses 191.54x less memory.
-```
-
-*** Example output for Problem 8+9: ***
-```
---- Running Autograder for Problem 9: GQA + SWDA + Attention Sinks Backward Pass ---
-Running test case: batch=1, heads_q=16, heads_kv=1, seq_len=4096, dim=16, window_size=256, sink_size=4
-✅ Forward Pass Results match
-✅ Backward Pass Results match on dQ
-✅ Backward Pass Results match on dK
-✅ Backward Pass Results match on dV
-```
-
-## Essential Resources
-
-These resources will support your hands-on learning journey:
-
-- [FlashAttention-2 Paper](https://arxiv.org/abs/2307.08691) - Study the algorithmic insights you'll implement
-- [Triton Documentation](https://triton-lang.org/) - Your GPU kernel programming reference
-- [Attention Is All You Need](https://arxiv.org/abs/1706.03762) - The mathematical foundation
+Across all problems, the **core design** of blockwise pointer arithmetic, accumulator rescaling, and online softmax remained consistent, while masking and pointer mapping strategies were adapted to introduce each new variant.
