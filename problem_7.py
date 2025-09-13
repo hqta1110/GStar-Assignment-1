@@ -48,16 +48,140 @@ def _flash_attention_forward_swa_kernel(
              (q_offsets[:, None] * q_stride_s + tl.arange(0, HEAD_DIM)[None, :])
     q_block = tl.load(q_ptrs, mask=q_offsets[:, None] < SEQ_LEN, other=0.0)
     
-    qk_scale = softmax_scale * 1.44269504
+    # convert to base-2 exponent domain for exp2 use
+    qk_scale = softmax_scale * 1.4426950408889634  # log2(e)
 
-    # --- STUDENT IMPLEMENTATION REQUIRED HERE ---
-    # Combine the GQA, SWA, and Sink logic.
-    # Combine all code from previous problems, and add the sink logic.
-    # You should have 3 phases:
-    # 1. Phase 0: Sink blocks that are before the sliding window
-    # 2. Phase 1: Off-Diagonal Blocks (within the window)
-    # 3. Phase 2: Diagonal Blocks
-    pass
+    # --- STUDENT IMPLEMENTATION: Combine GQA, SWA, and Sink logic ---
+    # Calculate sliding window bounds; ensure we don't re-process sink tokens.
+    window_start = max(SINK_SIZE, q_block_idx * BLOCK_M - WINDOW_SIZE + 1)
+    
+    # --- Phase 0: Sink blocks (always attend to first SINK_SIZE tokens) ---
+    sink_blocks = triton.cdiv(SINK_SIZE, BLOCK_N)
+    for sink_block_idx in range(sink_blocks):
+        start_n = sink_block_idx * BLOCK_N
+        k_offsets = start_n + tl.arange(0, BLOCK_N)
+            
+        # Load K as [HEAD_DIM, BLOCK_N]
+        k_ptrs = (
+            K_ptr
+            + batch_idx * k_stride_b
+            + kv_head_idx * k_stride_h
+            + (k_offsets[None, :] * k_stride_s + tl.arange(0, HEAD_DIM)[:, None])
+        )
+        # Load V as [BLOCK_N, HEAD_DIM]
+        v_ptrs = (
+            V_ptr
+            + batch_idx * v_stride_b
+            + kv_head_idx * v_stride_h
+            + (k_offsets[:, None] * v_stride_s + tl.arange(0, HEAD_DIM)[None, :])
+        )
+
+        k_block = tl.load(k_ptrs, mask=k_offsets[None, :] < SEQ_LEN, other=0.0)
+        v_block = tl.load(v_ptrs, mask=k_offsets[:, None] < SEQ_LEN, other=0.0).to(tl.float32)
+        scores = tl.dot(q_block, k_block) * qk_scale
+        
+        # For sink tokens, only apply causal mask and sink size limit
+        sink_mask = k_offsets[None, :] < SINK_SIZE
+        causal_mask = (q_offsets[:, None] >= k_offsets[None, :])
+        scores = tl.where(sink_mask & causal_mask, scores, -1e20)
+        
+        s_max = tl.max(scores, axis=1)
+        m_new = tl.maximum(m_i, s_max)
+        
+        exp_scale = tl.exp2(m_i - m_new)
+        acc = acc * exp_scale[:, None]
+        l_i = l_i * exp_scale
+        
+        prob = tl.exp2(scores - m_new[:, None])
+        acc += tl.dot(prob, v_block)
+        l_i += tl.sum(prob, axis=1)
+        
+        m_i = m_new
+    first_block = (window_start // BLOCK_N) * BLOCK_N
+    # --- Phase 1: Off-Diagonal Blocks (within the sliding window) ---
+    for start_n in range(first_block, q_block_idx * BLOCK_M, BLOCK_N):
+        k_offsets = start_n + tl.arange(0, BLOCK_N)
+        
+        # Load K as [HEAD_DIM, BLOCK_N]
+        k_ptrs = (
+            K_ptr
+            + batch_idx * k_stride_b
+            + kv_head_idx * k_stride_h
+            + (k_offsets[None, :] * k_stride_s + tl.arange(0, HEAD_DIM)[:, None])
+        )
+        # Load V as [BLOCK_N, HEAD_DIM]
+        v_ptrs = (
+            V_ptr
+            + batch_idx * v_stride_b
+            + kv_head_idx * v_stride_h
+            + (k_offsets[:, None] * v_stride_s + tl.arange(0, HEAD_DIM)[None, :])
+        )
+
+        k_block = tl.load(k_ptrs, mask=k_offsets[None, :] < SEQ_LEN, other=0.0)
+        v_block = tl.load(v_ptrs, mask=k_offsets[:, None] < SEQ_LEN, other=0.0).to(tl.float32)
+        scores = tl.dot(q_block, k_block) * qk_scale
+        
+        # Apply sliding window mask, causal mask, and exclude sink tokens (already handled)
+        window_mask = (q_offsets[:, None] - k_offsets[None, :]) < WINDOW_SIZE
+        causal_mask = (q_offsets[:, None] >= k_offsets[None, :])
+        non_sink_mask = k_offsets[None, :] >= SINK_SIZE
+        scores = tl.where(window_mask & causal_mask & non_sink_mask, scores, -1e20)
+        
+        s_max = tl.max(scores, axis=1)
+        m_new = tl.maximum(m_i, s_max)
+        
+        exp_scale = tl.exp2(m_i - m_new)
+        acc = acc * exp_scale[:, None]
+        l_i = l_i * exp_scale
+        
+        prob = tl.exp2(scores - m_new[:, None])
+        acc += tl.dot(prob, v_block)
+        l_i += tl.sum(prob, axis=1)
+        
+        m_i = m_new
+
+    # --- Phase 2: Diagonal Blocks ---
+    diag_start = q_block_idx * BLOCK_M
+    for start_n in range(diag_start, (q_block_idx + 1) * BLOCK_M, BLOCK_N):
+        k_offsets = start_n + tl.arange(0, BLOCK_N)
+        
+        # Load K as [HEAD_DIM, BLOCK_N]
+        k_ptrs = (
+            K_ptr
+            + batch_idx * k_stride_b
+            + kv_head_idx * k_stride_h
+            + (k_offsets[None, :] * k_stride_s + tl.arange(0, HEAD_DIM)[:, None])
+        )
+        # Load V as [BLOCK_N, HEAD_DIM]
+        v_ptrs = (
+            V_ptr
+            + batch_idx * v_stride_b
+            + kv_head_idx * v_stride_h
+            + (k_offsets[:, None] * v_stride_s + tl.arange(0, HEAD_DIM)[None, :])
+        )
+
+        k_block = tl.load(k_ptrs, mask=k_offsets[None, :] < SEQ_LEN, other=0.0)
+        v_block = tl.load(v_ptrs, mask=k_offsets[:, None] < SEQ_LEN, other=0.0).to(tl.float32)
+        scores = tl.dot(q_block, k_block) * qk_scale
+        
+        # Apply sliding window mask, causal mask, and exclude sink tokens
+        window_mask = (q_offsets[:, None] - k_offsets[None, :]) < WINDOW_SIZE
+        causal_mask = (q_offsets[:, None] >= k_offsets[None, :])
+        non_sink_mask = k_offsets[None, :] >= SINK_SIZE
+        scores = tl.where(window_mask & causal_mask & non_sink_mask, scores, -1e20)
+        
+        s_max = tl.max(scores, axis=1)
+        m_new = tl.maximum(m_i, s_max)
+        
+        exp_scale = tl.exp2(m_i - m_new)
+        acc = acc * exp_scale[:, None]
+        l_i = l_i * exp_scale
+        
+        prob = tl.exp2(scores - m_new[:, None])
+        acc += tl.dot(prob, v_block)
+        l_i += tl.sum(prob, axis=1)
+        
+        m_i = m_new
     # --- END OF STUDENT IMPLEMENTATION ---
 
     # 4. Normalize and write the final output block.
