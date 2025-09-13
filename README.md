@@ -10,100 +10,183 @@ This report documents the implementation of FlashAttention and its variants acro
 - Queries (`Q`), Keys (`K`), and Values (`V`) are divided into **blocks**.  
 - For each query block:
   - Stream over all key blocks.  
-  - Compute attention scores `S_ij = Q_block @ K_block^T / sqrt(d)`.  
-  - Apply masking if required:  
-    - **Causal mask** ensures tokens cannot attend to future tokens.  
-    - **Bounds mask** handles sequences shorter than the block size.  
-  - Update accumulators:
-    - `m_i`: running maximum of logits (for numerical stability).  
-    - `l_i`: running sum of exponentials.  
-    - `acc`: running weighted sum of values.  
-- Final output `O` is obtained as `acc / l_i`.  
-- This served as the **reference baseline** for later Triton kernels.
+  - Compute attention scores:
+
+    ```python
+    scores = (Q_block @ K_block.T) / math.sqrt(d)
+    ```
+
+  - Apply masking:
+    - **Causal mask**:  
+      ```python
+      scores = scores.masked_fill(q_idx[:, None] < k_idx[None, :], float('-inf'))
+      ```
+    - **Bounds mask** for short sequences.  
+  - Update accumulators (`m_i`, `l_i`, `acc`) using the online softmax method.  
+
+- Final output:  
+  ```python
+  O = acc / l_i[:, None]
+````
+
+* Serves as the **reference baseline** for all Triton kernels.
 
 ---
 
 ## Problem 2 — Introduction to Triton
 
-- Learned Triton’s programming model:  
-  - **Block-level parallelism**: each kernel instance processes a query block.  
-  - **Pointer arithmetic**: construct memory pointers with tensor strides (`stride_b`, `stride_h`, `stride_s`).  
-  - **Vectorized loading**: use `tl.load` with masks to safely fetch data into SRAM.  
-- Implemented simple examples to practice **offset calculation** and **masking**.  
-- No attention logic yet, but built the foundation for memory-efficient kernels in later problems.
+* Learned **Triton’s programming model**: block-level execution, pointers, and masks.
+
+* Practiced **pointer arithmetic** for batched tensors:
+
+  ```python
+  offsets = pid * BLOCK + tl.arange(0, BLOCK)
+  ptrs = base_ptr + offsets * stride
+  data = tl.load(ptrs, mask=offsets < n_elements, other=0.0)
+  ```
+
+* No attention yet, but established how to work with **offsets, masks, and memory loading** in Triton.
 
 ---
 
 ## Problem 3 — FlashAttention in Triton (Non-Causal)
 
-- First full Triton implementation of FlashAttention forward pass.  
-- Used the **same online softmax method** as in Problem 1 (`m_i`, `l_i`, `acc`).  
-- Key elements:
-  - **Pointer construction**: queries, keys, and values are loaded into SRAM via block offsets.  
-  - **Bounds masks**: prevent out-of-bounds reads when sequence length is not divisible by block size.  
-  - **Accumulation loop**: iterate over key blocks, compute `Q_block @ K_block^T`, rescale accumulators, and update with new contributions.  
-- Produces correct outputs for the non-causal case, establishing the Triton baseline.
+* Implemented FlashAttention forward pass in Triton.
+
+* Core loop over key blocks:
+
+  ```python
+  for start_n in range(0, N_CTX, BLOCK_N):
+      k_ptrs = K_ptr + ...
+      v_ptrs = V_ptr + ...
+      K_block = tl.load(k_ptrs, mask=mask_k)
+      V_block = tl.load(v_ptrs, mask=mask_v)
+
+      scores = tl.dot(Q_block, K_block)
+      ...
+      acc = acc * exp_scale[:, None] + tl.dot(p, V_block)
+      l_i = l_i * exp_scale + tl.sum(p, axis=1)
+  ```
+
+* Key features:
+
+  * **Pointer construction** for Q/K/V using strides.
+  * **Bounds masks** applied during `tl.load`.
+  * Online softmax rescaling (`m_i`, `l_i`, `acc`) same as Problem 1.
 
 ---
 
 ## Problem 4 — FlashAttention with Causal Masking
 
-- Extended Problem 3 to support **causal masking**.  
-- Introduced a **two-phase strategy**:
-  1. **Off-diagonal blocks** (where all keys precede the current query block): no masking needed.  
-  2. **Diagonal block** (where queries and keys overlap): apply per-element causal mask `q_idx >= k_idx`.  
-- This optimization avoids unnecessary masking in most blocks and improves efficiency.  
-- Other logic (online softmax, pointer arithmetic, accumulation) reused from Problem 3.
+* Extended Problem 3 with **causal masking**.
+
+* Implemented **two-phase strategy**:
+
+  * **Off-diagonal blocks**: no causal check.
+  * **Diagonal block**: apply causal mask:
+
+    ```python
+    causal_mask = q_offsets[:, None] >= k_offsets[None, :]
+    scores = tl.where(causal_mask, scores, float('-inf'))
+    ```
+
+* Reduced branching overhead while maintaining correctness.
+
+* Pointer arithmetic and online softmax are unchanged from Problem 3.
 
 ---
 
 ## Problem 5 — Grouped-Query Attention (GQA)
 
-- Built on the kernel from Problems 3–4.  
-- Implemented **head-sharing** between queries and fewer key/value heads:  
-  - Mapping: `kv_head_idx = q_head_idx // (num_q_heads // num_kv_heads)`.  
-- Key modifications:
-  - **Pointer arithmetic** for K and V changed to use `kv_head_idx` instead of `q_head_idx`.  
-  - Q still uses its original head index.  
-- This reduces the memory and compute cost of storing/processing K and V, while keeping the rest of the kernel unchanged.  
-- Masking and online softmax logic are identical to earlier problems.
+* Built on Problems 3–4.
+
+* Introduced **head sharing** for K/V:
+
+  ```python
+  q_per_kv = n_q_heads // n_kv_heads
+  kv_head_idx = q_head_idx // q_per_kv
+  ```
+
+* Modified **pointer arithmetic** for K/V:
+
+  ```python
+  k_ptrs = K_ptr + batch * k_stride_b + kv_head_idx * k_stride_h + ...
+  v_ptrs = V_ptr + batch * v_stride_b + kv_head_idx * v_stride_h + ...
+  ```
+
+* Only K/V head indexing changed.
+
+* Online softmax and masking identical to earlier problems.
 
 ---
 
 ## Problem 6 — Sliding Window Attention (SWA)
 
-- Extended FlashAttention to support **local attention** with a fixed window size.  
-- Modifications compared to Problem 3–5:
-  - **Restricted iteration range**: for each query block, only process key blocks within the sliding window.  
-  - **Window mask**: ensure only tokens inside the window contribute to attention scores.  
-- Combined naturally with causal masking when needed.  
-- This shows how the blockwise pointer/masking framework can be adapted for locality constraints.
+* Extended to **local attention** with a fixed window.
+
+* Adjusted **iteration range** of key blocks:
+
+  ```python
+  window_start = max(0, q_block_start - WINDOW_SIZE)
+  for start_n in range(window_start, q_block_start + 1, BLOCK_N):
+      ...
+  ```
+
+* Added **window mask**:
+
+  ```python
+  window_mask = (q_offsets[:, None] - k_offsets[None, :]) < WINDOW_SIZE
+  scores = tl.where(window_mask, scores, float('-inf'))
+  ```
+
+* Works with causal masking and GQA.
+
+* Rest of kernel logic unchanged.
 
 ---
 
 ## Problem 7 — Attention Sinks (with GQA + SWA)
 
-- Final problem combined **GQA**, **sliding window attention**, and **attention sinks**.  
-- Design divided into multiple phases:
-  1. **Sink phase**: process initial sink tokens (globally visible to all queries).  
-  2. **Windowed off-diagonal phase**: process non-sink tokens within the sliding window.  
-  3. **Diagonal phase**: handle overlapping query/key blocks, applying both causal and window masks, and excluding sink tokens with a **non-sink mask**.  
-- Reused:
-  - GQA head mapping from Problem 5.  
-  - Sliding window iteration and masks from Problem 6.  
-- The main new addition is the **sink mask** and handling sinks as a separate phase.  
-- This problem demonstrated how multiple advanced constraints can be layered on top of the same core FlashAttention framework.
+* Combined **GQA**, **SWA**, and **attention sinks**.
+
+* Multi-phase design:
+
+  1. **Sink phase**: process sink tokens (`k_offsets < SINK_SIZE`).
+  2. **Windowed off-diagonal phase**: process non-sink tokens inside the window.
+  3. **Diagonal phase**: handle overlap, exclude sinks with `non_sink_mask`.
+
+* Example masking:
+
+  ```python
+  sink_mask = k_offsets < SINK_SIZE
+  non_sink_mask = k_offsets >= SINK_SIZE
+  combined_mask = window_mask & causal_mask & non_sink_mask
+  scores = tl.where(combined_mask, scores, float('-inf'))
+  ```
+
+* Reuses:
+
+  * GQA mapping from Problem 5.
+  * Sliding window logic from Problem 6.
+
+* Main addition: **sink mask + separate sink phase**.
 
 ---
 
 ## Summary
 
-- **Problem 1** provided a PyTorch baseline for FlashAttention.  
-- **Problem 2** introduced Triton basics.  
-- **Problem 3** implemented FlashAttention in Triton (non-causal).  
-- **Problem 4** added causal masking with a two-phase diagonal/off-diagonal approach.  
-- **Problem 5** introduced Grouped-Query Attention by modifying key/value head pointers.  
-- **Problem 6** extended the kernel with sliding window constraints.  
-- **Problem 7** integrated GQA, SWA, and sink tokens into a single unified kernel.  
+* **Problem 1**: PyTorch baseline implementation.
+* **Problem 2**: Triton basics (offsets, pointers, masks).
+* **Problem 3**: Triton FlashAttention (non-causal).
+* **Problem 4**: Added causal masking with two-phase design.
+* **Problem 5**: Introduced GQA (pointer remapping for K/V).
+* **Problem 6**: Implemented sliding window attention.
+* **Problem 7**: Integrated GQA + SWA + attention sinks.
 
-Across all problems, the **core design** of blockwise pointer arithmetic, accumulator rescaling, and online softmax remained consistent, while masking and pointer mapping strategies were adapted to introduce each new variant.
+Across all problems, the **core design** remains consistent:
+
+* Blockwise pointer arithmetic for memory efficiency.
+* Online softmax with rescaling for numerical stability.
+* Mask composition (bounds, causal, window, sink) applied flexibly.
+
+```
