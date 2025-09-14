@@ -54,7 +54,7 @@ All problems (3–7) follow the same block-streaming and online-softmax calculat
 
 ## Technical Implementation
 
-### A. Head mapping (GQA — Problems 5, 6, 7)
+### A. Head mapping (GQA - Problems 5, 6, 7)
 
 * **Problem 3:** use `head_idx` directly for K/V.
 * **Problem 5:** introduce GQA. Compute
