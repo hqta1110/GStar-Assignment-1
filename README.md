@@ -1,191 +1,113 @@
 # FlashAttention Assignment Report
 
-This report documents the implementation of FlashAttention and its variants across seven problems. Each problem builds upon earlier work, reusing the same online softmax and blockwise strategy, while introducing new masking or memory management techniques.
+This report documents the implementation of FlashAttention and its variants across seven problems. Later problem builds upon earlier work, reusing the same online softmax and blockwise strategy, while introducing new masking or memory management techniques.
+
+## Common Pattern
+
+All problem follow the same block-streaming and online-softmax calculation. The main difference between each problem is the way I handle indices, offsets and masks
+
+1. **Calculate per-program inddices**
+    * `q_block_idx = tl.program_id(0)` picks the query block (row tile).
+    * `batch_head_idx = tl.program_id(1)` encodes batch and head; use this to calculate `batch_idx`, `q_head_idx`, `kv_head_idx` for problem_5 onwards.
+2. **Initialize value**
+    * Init the value for m_i, l_i, acc
+3. **Load Q block**
+    * `q_offsets = q_block_idx * BLOCK_M + arange(BLOCK_M)`.
+    * Build `q_ptrs` using `batch_idx`, `q_head_idx` (or `head_idx` for problem 5 onwards), and `q_offsets` -> `tl.load(q_ptrs, mask=q_offsets < SEQ_LEN)` to get `q_block`
+4. **Stream K/V block**
+    * For each `start_n` (block start) compute `k_offsets = start_n + arange(BLOCK_N)`.
+    * Build `k_ptrs` and `v_ptrs` with `batch_idx`, `head_idx` and `k_offsets` for K/V. Load `k_block` and `v_block`. (Head index for K/V may be `head_idx` or a mapped `kv_head_idx` depending on problem).
+5. **Compute scores and mask**
+   * `scores = dot(q_block, k_block) * scale`.
+   * Construct a `valid_mask` (depends on causal check, window, sink, and sequence end).
+   * Apply mask via `scores = where(valid_mask, scores, -inf)` (i.e., clamp invalid positions to a large negative). This keeps the online-softmax update identical across variants.
+
+6. **Online softmax update**
+   * `s_max = max(scores, axis=1)` → `m_new = max(m_i, s_max)`
+   * Rescale accumulator: `acc *= 2^(m_i - m_new)`, `l_i *= 2^(m_i - m_new)` (implemented with `tl.exp2`)
+   * `prob = 2^(scores - m_new[:,None])` masked appropriately.
+   * `acc += dot(prob, v_block)` ; `l_i += sum(prob, axis=1)` ; `m_i = m_new`.
+     This online formulation lets you stream K/V blocks without storing full score matrices. (See Problem 3).&#x20;
+
+7. **Finalize**
+   * `acc /= (l_i[:,None] + eps)` and `store` back to output `O` via pointer built from `q_offsets` and `q_head_idx` (or `head_idx`).
+
+**Key note:** the **online-softmax code never changes** — only the **pointer arithmetic** (which K/V blocks to load) and the **mask** (which scores are allowed) change between problems.
+
+## Technical implementation
+
+Below I show how solution is difference between problems.
+
+### A. Head mapping (Grouped-Query Attention — Problems 5, 6, 7)
+
+**What changes:** which head index is used when forming `k_ptrs` and `v_ptrs`.
+
+* **Baseline (Problem 3):** use `head_idx` for K/V pointers (one K/V per Q head)
+
+* **GQA (Problem 5):** compute `q_per_kv_heads = N_Q_HEADS // N_KV_HEADS` then `kv_head_idx = q_head_idx // q_per_kv_heads`. Use `kv_head_idx` in `k_ptrs`/`v_ptrs`. This is the only change required to reuse K/V across groups — everything else (including Q loads and O stores) keeps using the original `q_head_idx`. The code that implements this mapping sits at the top of the kernel.&#x20;
+
+* **SWA & Sink variants (Problems 6 & 7):** reuse the same mapping (`kv_head_idx`) and simply feed it to pointer arithmetic for K/V loads. (See Problem 6 / Problem 7). Problem 6’s student section explicitly computes `kv_head_idx` similarly; Problem 7 shows the same mapping in its GQA block. (Problem 6 and 7 student implementations both follow the same pattern.)
+---
+
+### B. Offsets & pointer arithmetic (all problems)
+
+**Common recipe:**
+
+* `q_offsets = q_block_idx * BLOCK_M + arange(BLOCK_M)`
+* `k_offsets = start_n + arange(BLOCK_N)`
+* `q_ptrs = Q_ptr + batch_idx * q_stride_b + q_head_idx * q_stride_h + (q_offsets[:,None] * q_stride_s + arange(HEAD_DIM)[None,:])`
+* `k_ptrs` / `v_ptrs` similar but with head index for K/V (either `head_idx` or `kv_head_idx`), and with `k_offsets` instead of `q_offsets`.
+
+**Notes**
+
+* All implementations use `mask=` in `tl.load` to avoid out-of-range reads (e.g., `mask=k_offsets < SEQ_LEN`).
+* The pointer arithmetic is the unifying low-level trick: by controlling `start_n` ranges and the head index used, every attention variant is implemented without copying or reshaping K/V in memory. This is visible in all student kernels.
+---
+
+### C. Masking strategies (Problems 4, 5, 6, 7)
+
+**Core approach (all masked variants):** build a boolean `valid_mask` and apply `scores = where(valid_mask, scores, -INF)`. This lets the same online-softmax update run unchanged.
+
+* **Non-masked baseline (Problem 3):** no mask; all `k_offsets` are valid until sequence-end. (Implementation shows the online-softmax update directly).&#x20;
+
+* **Causal (Problem 4):** In diagonal blocks (where query and key indexes overlap) build `causal_mask = (q_offsets[:,None] >= k_offsets[None,:])`. Combine with `valid_cols = (k_offsets < SEQ_LEN)` to produce `valid_mask = causal_mask & valid_cols[None,:]`. Apply with `where`. This prevents “future” keys from contributing when query index ≤ key index. Problem 4’s kernel has a two-phase loop: off-diagonal (no mask) and diagonal (apply causal mask). *(This is the standard pattern used later in Problem 5).* (Problem 4 content provided).
+
+* **GQA + causal (Problem 5):** reuses the causal-mask recipe from Problem 4 but uses `kv_head_idx` for K/V pointer computation; the masking logic for diagonal tiles is the same as Problem 4.&#x20;
+
+* **Sliding window (Problem 6):** combine a **window mask** with causal condition:
+
+  * `window_mask = (q_offsets[:,None] - k_offsets[None,:]) < WINDOW_SIZE`
+  * `causal_mask = (q_offsets[:,None] >= k_offsets[None,:])`
+  * `valid_mask = window_mask & causal_mask & (k_offsets < SEQ_LEN)`
+    This enforces both locality (only recent keys within `WINDOW_SIZE`) and causality — implemented for both off-diagonal (windowed range) and diagonal blocks. The student code computes a `window_start` and *only iterates key blocks within the window*, further reducing loads. *(Problem 6 shows the sliding-window mask and the window start calculation.)*
+
+* **Sink + SWA + GQA (Problem 7):** three-phase approach:
+
+  1. **Sink phase (phase 0):** first `SINK_SIZE` tokens are processed separately. For sink blocks use `sink_mask = k_offsets < SINK_SIZE` combined with causal mask; these tokens are globally visible (subject to causality) to all queries. Processing sinks first ensures they are in the running accumulator early.&#x20;
+  2. **Window phase (phase 1):** only process key blocks in the sliding window `[window_start, q_block_idx * BLOCK_M)`. Apply `window_mask & causal_mask & non_sink_mask` where `non_sink_mask` excludes sink keys in this phase.&#x20;
+  3. **Diagonal phase (phase 2):** process the diagonal block(s) with the same triple-mask and finalize.
+     The student implementation enforces masks via `tl.where(..., scores, -1e20)` and uses `triton.cdiv` to compute sink block counts.&#x20;
+
+**Why mask-by-clamping works:** it avoids branching in the inner loop, keeps vectorized math simple, and requires no special-case handling in the online-softmax logic. Masking decisions only influence `scores` and consequently the `prob` term (invalid positions become \~0).
 
 ---
 
-## Problem 1 — PyTorch FlashAttention (Reference Implementation)
+### D. Window / phase selection (Problems 6 & 7)
 
-- Implemented the **forward pass** of FlashAttention in pure PyTorch.  
-- Queries (`Q`), Keys (`K`), and Values (`V`) are divided into **blocks**.  
-- For each query block:
-  - Stream over all key blocks.  
-  - Compute attention scores:
+**Window start computation:** two equivalent responsibilities:
 
-    ```python
-    scores = (Q_block @ K_block.T) / math.sqrt(d)
-    ```
+* determine which key blocks to iterate (avoid scanning entire history),
+* and ensure sink blocks are only processed in the sink phase (Problem 7).
 
-  - Apply masking:
-    - **Causal mask**:  
-      ```python
-      scores = scores.masked_fill(q_idx[:, None] < k_idx[None, :], float('-inf'))
-      ```
-    - **Bounds mask** for short sequences.  
-  - Update accumulators (`m_i`, `l_i`, `acc`) using the online softmax method.  
+**Problem 6 (SWA)**: student code computes a `window_start` (it used `tl.maximum(0, q_block_idx - WINDOW_SIZE + 1)` as a placeholder) and iterates `start_n` from `window_start` to just before the query block. It also applies `window_mask` on the per-element level. This both reduces DRAM reads and enforces local attention. (See Problem 6 implementation — window start + masked loop.)
 
-- Final output:  
-  ```python
-  O = acc / l_i[:, None]
-  ```
-* Serves as the **reference baseline** for all Triton kernels.
+**Problem 7 (SWA + Sink)**: computes `window_start = max(SINK_SIZE, q_block_idx * BLOCK_M - WINDOW_SIZE + 1)` so sink tokens (first `SINK_SIZE`) are not reprocessed in the window phase. This file organizes the kernel into **Phase 0 (sink)**, **Phase 1 (windowed off-diagonal)**, **Phase 2 (diagonal)**. That ordering improves numerical behavior of the online-softmax (sink tokens accumulate early) and reduces duplicate loads.&#x20;
 
----
 
-## Problem 2 — Introduction to Triton
+## 4. Key takeaways / best practices (from the student code)
 
-* Learned **Triton’s programming model**: block-level execution, pointers, and masks.
+1. **Pointer arithmetic is the main lever.** Changing `k_ptrs`/`v_ptrs` (head index and `k_offsets`) implements different attention patterns without layout change.
+2. **Mask-by-clamping is low-cost and composable.** Use boolean masks combined with `tl.where(..., -INF)` so the same online-softmax update is reused for all topologies.
+3. **GQA is trivial to add.** Compute `kv_head_idx = q_head_idx // (N_Q_HEADS // N_KV_HEADS)` and use it for K/V loads — no tensor reshaping required.
+4. **Phase ordering matters for numerics and bandwidth.** Process sink tokens first (if any) so they join the running accumulator early; then process windowed history; finish with diagonal tiles. This reduces redundant loads and produces more stable `m_i` updates.
 
-* Practiced **pointer arithmetic** for batched tensors:
-
-  ```python
-  offsets = pid * BLOCK + tl.arange(0, BLOCK)
-  ptrs = base_ptr + offsets * stride
-  data = tl.load(ptrs, mask=offsets < n_elements, other=0.0)
-  ```
-
-* No attention yet, but established how to work with **offsets, masks, and memory loading** in Triton.
-
----
-
-## Problem 3 — FlashAttention in Triton (Non-Causal)
-
-* Implemented FlashAttention forward pass in Triton.
-
-* Core loop over key blocks:
-
-  ```python
-  for start_n in range(0, N_CTX, BLOCK_N):
-      k_ptrs = K_ptr + ...
-      v_ptrs = V_ptr + ...
-      K_block = tl.load(k_ptrs, mask=mask_k)
-      V_block = tl.load(v_ptrs, mask=mask_v)
-
-      scores = tl.dot(Q_block, K_block)
-      ...
-      acc = acc * exp_scale[:, None] + tl.dot(p, V_block)
-      l_i = l_i * exp_scale + tl.sum(p, axis=1)
-  ```
-
-* Key features:
-
-  * **Pointer construction** for Q/K/V using strides.
-  * **Bounds masks** applied during `tl.load`.
-  * Online softmax rescaling (`m_i`, `l_i`, `acc`) same as Problem 1.
-
----
-
-## Problem 4 — FlashAttention with Causal Masking
-
-* Extended Problem 3 with **causal masking**.
-
-* Implemented **two-phase strategy**:
-
-  * **Off-diagonal blocks**: no causal check.
-  * **Diagonal block**: apply causal mask:
-
-    ```python
-    causal_mask = q_offsets[:, None] >= k_offsets[None, :]
-    scores = tl.where(causal_mask, scores, float('-inf'))
-    ```
-
-* Reduced branching overhead while maintaining correctness.
-
-* Pointer arithmetic and online softmax are unchanged from Problem 3.
-
----
-
-## Problem 5 — Grouped-Query Attention (GQA)
-
-* Built on Problems 3–4.
-
-* Introduced **head sharing** for K/V:
-
-  ```python
-  q_per_kv = n_q_heads // n_kv_heads
-  kv_head_idx = q_head_idx // q_per_kv
-  ```
-
-* Modified **pointer arithmetic** for K/V:
-
-  ```python
-  k_ptrs = K_ptr + batch * k_stride_b + kv_head_idx * k_stride_h + ...
-  v_ptrs = V_ptr + batch * v_stride_b + kv_head_idx * v_stride_h + ...
-  ```
-
-* Only K/V head indexing changed.
-
-* Online softmax and masking identical to earlier problems.
-
----
-
-## Problem 6 — Sliding Window Attention (SWA)
-
-* Extended to **local attention** with a fixed window.
-
-* Adjusted **iteration range** of key blocks:
-
-  ```python
-  window_start = max(0, q_block_start - WINDOW_SIZE)
-  for start_n in range(window_start, q_block_start + 1, BLOCK_N):
-      ...
-  ```
-
-* Added **window mask**:
-
-  ```python
-  window_mask = (q_offsets[:, None] - k_offsets[None, :]) < WINDOW_SIZE
-  scores = tl.where(window_mask, scores, float('-inf'))
-  ```
-
-* Works with causal masking and GQA.
-
-* Rest of kernel logic unchanged.
-
----
-
-## Problem 7 — Attention Sinks (with GQA + SWA)
-
-* Combined **GQA**, **SWA**, and **attention sinks**.
-
-* Multi-phase design:
-
-  1. **Sink phase**: process sink tokens (`k_offsets < SINK_SIZE`).
-  2. **Windowed off-diagonal phase**: process non-sink tokens inside the window.
-  3. **Diagonal phase**: handle overlap, exclude sinks with `non_sink_mask`.
-
-* Example masking:
-
-  ```python
-  sink_mask = k_offsets < SINK_SIZE
-  non_sink_mask = k_offsets >= SINK_SIZE
-  combined_mask = window_mask & causal_mask & non_sink_mask
-  scores = tl.where(combined_mask, scores, float('-inf'))
-  ```
-
-* Reuses:
-
-  * GQA mapping from Problem 5.
-  * Sliding window logic from Problem 6.
-
-* Main addition: **sink mask + separate sink phase**.
-
----
-
-## Summary
-
-* **Problem 1**: PyTorch baseline implementation.
-* **Problem 2**: Triton basics (offsets, pointers, masks).
-* **Problem 3**: Triton FlashAttention (non-causal).
-* **Problem 4**: Added causal masking with two-phase design.
-* **Problem 5**: Introduced GQA (pointer remapping for K/V).
-* **Problem 6**: Implemented sliding window attention.
-* **Problem 7**: Integrated GQA + SWA + attention sinks.
-
-Across all problems, the **core design** remains consistent:
-
-* Blockwise pointer arithmetic for memory efficiency.
-* Online softmax with rescaling for numerical stability.
-* Mask composition (bounds, causal, window, sink) applied flexibly.
-
-```
